@@ -1,0 +1,665 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Babylon Greedy Block World — First Person (outline, easier mine, respawn, jump)</title>
+<style>
+html, body {
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    overflow: hidden;
+    background: #111;
+    font-family: sans-serif;
+}
+#renderCanvas {
+    width: 100%;
+    height: 100%;
+    touch-action: none;
+    display: block;
+}
+#hotbar {
+    position: absolute;
+    bottom: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    display: flex;
+    gap: 10px;
+    z-index: 20;
+}
+.slot {
+    width: 50px;
+    height: 50px;
+    border: 2px solid #999;
+    background: rgba(34,34,34,0.9);
+    box-sizing: border-box;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #ddd;
+}
+.slot.active { border-color: white; }
+#hint {
+    position: absolute;
+    top: 8px;
+    left: 50%;
+    transform: translateX(-50%);
+    color: #fff;
+    background: rgba(0,0,0,0.45);
+    padding: 6px 10px;
+    border-radius: 6px;
+    z-index: 30;
+    pointer-events: none;
+}
+#crosshair {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 24px;
+    height: 24px;
+    margin-left: -12px;
+    margin-top: -12px;
+    pointer-events: none;
+    z-index: 40;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+#crosshair::before {
+    content: "+";
+    color: rgba(255,255,255,0.9);
+    font-size: 20px;
+    font-weight: 700;
+    text-shadow: 0 0 6px rgba(0,0,0,0.8);
+}
+#info {
+    position: absolute;
+    left: 8px;
+    top: 8px;
+    color: #ddd;
+    z-index: 30;
+    background: rgba(0,0,0,0.35);
+    padding: 6px 8px;
+    border-radius: 6px;
+    font-size: 13px;
+}
+#jumpBtn {
+    position: absolute;
+    right: 12px;
+    top: 12px;
+    z-index: 35;
+    background: rgba(0,0,0,0.5);
+    color: white;
+    border: 1px solid #666;
+    padding: 8px 10px;
+    border-radius: 6px;
+    cursor: pointer;
+}
+</style>
+</head>
+<body>
+<canvas id="renderCanvas"></canvas>
+<div id="hotbar">
+    <div class="slot active">1</div>
+    <div class="slot">2</div>
+    <div class="slot">3</div>
+    <div class="slot">4</div>
+</div>
+<div id="hint">Click canvas to enter first-person (pointer lock). WASD to move, Space or Jump to jump. Left-click to mine, Right-click to place.</div>
+<div id="crosshair"></div>
+<div id="info"></div>
+<button id="jumpBtn">Jump</button>
+
+<script src="https://cdn.babylonjs.com/babylon.js"></script>
+<script>
+/*
+Features added / changed in this version:
+- White outline box drawn around the block under the crosshair (updated every frame).
+- Mining is easier: left-click instantly breaks the targeted block; holding left mouse will break repeatedly with a short interval.
+- Jump button and Space key to jump. Grounded detection implemented with a downward ray.
+- Respawn when falling below a threshold (y < -20).
+- Bug fixes and safer placement (prevents placing inside the player).
+- Chunked world with dynamic loading remains; meshes remain pickable.
+- Gravity reduced so falling feels less intense.
+*/
+
+const canvas = document.getElementById("renderCanvas");
+const engine = new BABYLON.Engine(canvas, true, { preserveDrawingBuffer: true, stencil: true });
+const scene = new BABYLON.Scene(engine);
+scene.clearColor = new BABYLON.Color4(0.53, 0.81, 0.98, 1);
+scene.collisionsEnabled = true;
+// Reduced gravity (was -0.9) so falling is gentler
+scene.gravity = new BABYLON.Vector3(0, -0.05, 0);
+
+ // Note: camera.applyGravity uses scene.gravity
+
+// world/chunk config
+const CHUNK_SIZE = 16;      // X/Z size per chunk
+const CHUNK_HEIGHT = 16;    // Y size per chunk
+let RENDER_DISTANCE_CHUNKS = 2; // how many chunks radius to render around player
+
+// block types
+const BLOCKS = {
+    AIR: 0,
+    GRASS: 1,
+    DIRT: 5,
+    STONE: 6,
+    WOOD: 2,
+    LEAVES: 3,
+    PLANKS: 4
+};
+const COLORS = {
+    1: new BABYLON.Color3(0.2, 0.7, 0.2), // grass top
+    5: new BABYLON.Color3(0.4, 0.25, 0.1), // dirt
+    6: new BABYLON.Color3(0.5, 0.5, 0.55), // stone
+    2: new BABYLON.Color3(0.55, 0.27, 0.07), // wood
+    3: new BABYLON.Color3(0.0, 0.5, 0.0), // leaves
+    4: new BABYLON.Color3(0.85, 0.75, 0.55) // planks
+};
+
+// container for generated chunk data and meshes
+const chunks = new Map(); // key: "cx,cz" -> {data:Uint8Array, mesh:BABYLON.Mesh|null, cx, cz}
+
+function chunkKey(cx, cz) { return cx + "," + cz; }
+function localIndex(x,y,z) { return (y * CHUNK_SIZE * CHUNK_SIZE) + (z * CHUNK_SIZE) + x; }
+function setLocal(arr,x,y,z,val) { arr[localIndex(x,y,z)] = val; }
+function getLocal(arr,x,y,z) { return arr[localIndex(x,y,z)]; }
+
+// generate a chunk's block data (simple flat-ish terrain)
+function makeChunkData(cx, cz) {
+    const data = new Uint8Array(CHUNK_SIZE * CHUNK_HEIGHT * CHUNK_SIZE);
+    for (let x = 0; x < CHUNK_SIZE; x++) {
+        for (let z = 0; z < CHUNK_SIZE; z++) {
+            // simple height noise using cx/cz so chunks differ slightly
+            const worldX = cx * CHUNK_SIZE + x;
+            const worldZ = cz * CHUNK_SIZE + z;
+            const h = 4 + Math.floor((Math.sin(worldX * 0.2) + Math.cos(worldZ * 0.2)) * 1.2); // between 2..6-ish
+            for (let y = 0; y < CHUNK_HEIGHT; y++) {
+                const idx = localIndex(x,y,z);
+                if (y === h) data[idx] = BLOCKS.GRASS;
+                else if (y < h && y >= Math.max(0, h-3)) data[idx] = BLOCKS.DIRT;
+                else if (y < Math.max(0, h-3)) data[idx] = BLOCKS.STONE;
+                else data[idx] = BLOCKS.AIR;
+            }
+        }
+    }
+
+    // low-chance tree in a chunk center
+    if (Math.random() < 0.25) {
+        const tx = Math.floor(CHUNK_SIZE/2) + (Math.random() > 0.5 ? 1 : -1);
+        const tz = Math.floor(CHUNK_SIZE/2);
+        // find ground y at (tx,tz)
+        let groundY = -1;
+        for (let y = CHUNK_HEIGHT-1; y >= 0; y--) {
+            if (getLocal(data, tx, y, tz) !== BLOCKS.AIR) { groundY = y; break; }
+        }
+        if (groundY >= 0 && groundY + 5 < CHUNK_HEIGHT) {
+            setLocal(data, tx, groundY+1, tz, BLOCKS.WOOD);
+            setLocal(data, tx, groundY+2, tz, BLOCKS.WOOD);
+            setLocal(data, tx, groundY+3, tz, BLOCKS.WOOD);
+            for (let dx=-1; dx<=1; dx++) for (let dz=-1; dz<=1; dz++) {
+                setLocal(data, tx+dx, groundY+4, tz+dz, BLOCKS.LEAVES);
+            }
+        }
+    }
+
+    return data;
+}
+
+// world accessors
+function getBlockAtWorld(gx, gy, gz) {
+    const cx = Math.floor(gx / CHUNK_SIZE);
+    const cz = Math.floor(gz / CHUNK_SIZE);
+    const key = chunkKey(cx, cz);
+    const chunk = chunks.get(key);
+    if (!chunk) return BLOCKS.AIR;
+    const lx = ((gx % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE;
+    const lz = ((gz % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE;
+    if (gy < 0 || gy >= CHUNK_HEIGHT) return BLOCKS.AIR;
+    return getLocal(chunk.data, lx, gy, lz);
+}
+
+function setBlockAtWorld(gx, gy, gz, block) {
+    const cx = Math.floor(gx / CHUNK_SIZE);
+    const cz = Math.floor(gz / CHUNK_SIZE);
+    const key = chunkKey(cx, cz);
+    let chunk = chunks.get(key);
+    if (!chunk) {
+        // create if missing (ensures you can set in unloaded chunk)
+        const data = makeChunkData(cx, cz);
+        chunk = { data, mesh: null, cx, cz };
+        chunks.set(key, chunk);
+    }
+    const lx = ((gx % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE;
+    const lz = ((gz % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE;
+    if (gy < 0 || gy >= CHUNK_HEIGHT) return false;
+    setLocal(chunk.data, lx, gy, lz, block);
+    // rebuild affected chunk and adjacent chunks (because faces on borders might change)
+    buildChunkMesh(cx, cz);
+    // adjacent
+    const neighbors = [[1,0],[ -1,0],[0,1],[0,-1]];
+    for (const n of neighbors) {
+        const ncx = cx + n[0], ncz = cz + n[1];
+        const nkey = chunkKey(ncx, ncz);
+        const nch = chunks.get(nkey);
+        if (nch) buildChunkMesh(ncx, ncz);
+    }
+    return true;
+}
+
+// mesh building for a chunk
+function buildChunkMesh(cx, cz) {
+    const key = chunkKey(cx, cz);
+    const chunk = chunks.get(key);
+    if (!chunk) return;
+    if (chunk.mesh) {
+        chunk.mesh.dispose();
+        chunk.mesh = null;
+    }
+
+    const positions = [];
+    const indices = [];
+    const colors = [];
+    let idx = 0;
+
+    function addFaceLocal(x,y,z, nx,ny,nz, color) {
+        // local cube corners (relative to chunk origin)
+        const p = [
+            [x,   y,   z  ], [x+1, y,   z  ], [x+1, y+1, z  ], [x,   y+1, z  ],
+            [x,   y,   z+1], [x+1, y,   z+1], [x+1, y+1, z+1], [x,   y+1, z+1]
+        ];
+        const faces = {
+            "0,0,-1":[0,1,2,3],
+            "0,0,1":[5,4,7,6],
+            "-1,0,0":[4,0,3,7],
+            "1,0,0":[1,5,6,2],
+            "0,1,0":[3,2,6,7],
+            "0,-1,0":[4,5,1,0]
+        }[`${nx},${ny},${nz}`];
+        if (!faces) return;
+        faces.forEach(i=>{
+            positions.push(p[i][0], p[i][1], p[i][2]);
+            colors.push(color.r, color.g, color.b, 1.0);
+        });
+        indices.push(idx, idx+1, idx+2, idx, idx+2, idx+3);
+        idx += 4;
+    }
+
+    const data = chunk.data;
+    for (let x = 0; x < CHUNK_SIZE; x++) {
+        for (let y = 0; y < CHUNK_HEIGHT; y++) {
+            for (let z = 0; z < CHUNK_SIZE; z++) {
+                const block = getLocal(data, x, y, z);
+                if (block === BLOCKS.AIR) continue;
+                const color = COLORS[block] || new BABYLON.Color3(1, 0, 1);
+                const gx = x + cx * CHUNK_SIZE, gz = z + cz * CHUNK_SIZE;
+                const neighbors = [[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]];
+                neighbors.forEach(d=>{
+                    const nb = getBlockAtWorld(gx + d[0], y + d[1], gz + d[2]);
+                    if (nb === BLOCKS.AIR) addFaceLocal(x, y, z, d[0], d[1], d[2], color);
+                });
+            }
+        }
+    }
+
+    if (positions.length === 0) { chunk.mesh = null; return; }
+
+    const mesh = new BABYLON.Mesh("chunk_" + key, scene);
+    const vd = new BABYLON.VertexData();
+    vd.positions = positions;
+    vd.indices = indices;
+    vd.colors = colors;
+    const normals = [];
+    BABYLON.VertexData.ComputeNormals(positions, indices, normals);
+    vd.normals = normals;
+    vd.applyToMesh(mesh, true);
+
+    mesh.position = new BABYLON.Vector3(cx * CHUNK_SIZE, 0, cz * CHUNK_SIZE);
+    mesh.isPickable = true;
+    mesh.checkCollisions = true;
+    mesh.receiveShadows = false;
+
+    const mat = new BABYLON.StandardMaterial("mat_chunk", scene);
+    mat.useVertexColor = true; mat.useVertexColors = true;
+    mat.specularColor = new BABYLON.Color3(0.1,0.1,0.1);
+    mat.backFaceCulling = false;
+    mesh.material = mat;
+
+    mesh.refreshBoundingInfo();
+    chunk.mesh = mesh;
+}
+
+// chunk loading
+function loadChunksAround(cx, cz, radius) {
+    const wanted = new Set();
+    for (let dx = -radius; dx <= radius; dx++) {
+        for (let dz = -radius; dz <= radius; dz++) {
+            const ncx = cx + dx, ncz = cz + dz;
+            const key = chunkKey(ncx, ncz);
+            wanted.add(key);
+            if (!chunks.has(key)) {
+                const data = makeChunkData(ncx, ncz);
+                chunks.set(key, { data, mesh: null, cx: ncx, cz: ncz });
+            }
+            const chunk = chunks.get(key);
+            if (!chunk.mesh) buildChunkMesh(ncx, ncz);
+        }
+    }
+    // dispose meshes outside radius (keep data cached)
+    for (const [key, chunk] of chunks.entries()) {
+        if (!wanted.has(key) && chunk.mesh) {
+            chunk.mesh.dispose();
+            chunk.mesh = null;
+        }
+    }
+}
+
+// initial chunks
+let visibleCenterChunk = { cx: 0, cz: 0 };
+const startChunkX = 0, startChunkZ = 0;
+loadChunksAround(startChunkX, startChunkZ, RENDER_DISTANCE_CHUNKS);
+visibleCenterChunk = { cx: startChunkX, cz: startChunkZ };
+
+// first-person camera
+const startX = Math.floor((startChunkX * CHUNK_SIZE) + CHUNK_SIZE/2) + 0.5;
+const startZ = Math.floor((startChunkZ * CHUNK_SIZE) + CHUNK_SIZE/2) + 0.5;
+const spawnPosition = new BABYLON.Vector3(startX, 8.0, startZ); // spawn higher to avoid being inside ground
+
+const camera = new BABYLON.UniversalCamera("fpsCam",
+    spawnPosition.clone(), scene);
+camera.attachControl(canvas, true);
+camera.speed = 0.2;
+camera.angularSensibility = 700;
+camera.keysUp.push(87); camera.keysDown.push(83);
+camera.keysLeft.push(65); camera.keysRight.push(68);
+camera.applyGravity = true;
+camera.checkCollisions = true;
+camera.ellipsoid = new BABYLON.Vector3(0.4, 0.9, 0.4);
+camera.minZ = 0.1;
+
+// pointer lock
+canvas.addEventListener("click", () => {
+    const el = canvas;
+    if (el.requestPointerLock) el.requestPointerLock();
+    else if (el.mozRequestPointerLock) el.mozRequestPointerLock();
+    else if (el.webkitRequestPointerLock) el.webkitRequestPointerLock();
+});
+
+// lights
+new BABYLON.HemisphericLight("hlight", new BABYLON.Vector3(0, 1, 0), scene).intensity = 0.95;
+const dlight = new BABYLON.DirectionalLight("dir", new BABYLON.Vector3(-0.5, -1, -0.5), scene);
+dlight.position = new BABYLON.Vector3(10, 20, 10);
+dlight.intensity = 0.6;
+
+// inventory
+let selected = BLOCKS.DIRT;
+document.addEventListener("keydown", e=>{
+    if (e.key >= "1" && e.key <= "4") {
+        const i = parseInt(e.key, 10) - 1;
+        document.querySelectorAll(".slot").forEach(s=>s.classList.remove("active"));
+        const slot = document.querySelectorAll(".slot")[i];
+        if (slot) slot.classList.add("active");
+        selected = [BLOCKS.GRASS, BLOCKS.WOOD, BLOCKS.LEAVES, BLOCKS.PLANKS][i];
+    }
+});
+
+// CROSSHAIR TARGETING & OUTLINE
+const outline = BABYLON.MeshBuilder.CreateBox("outlineBox", {size:1.02}, scene);
+outline.isPickable = false;
+outline.alwaysSelectAsActiveMesh = false;
+outline.visibility = 0.9;
+outline.renderingGroupId = 2;
+const outlineMat = new BABYLON.StandardMaterial("outlineMat", scene);
+outlineMat.diffuseColor = new BABYLON.Color3(0,0,0);
+outlineMat.emissiveColor = new BABYLON.Color3(1,1,1);
+outlineMat.alpha = 0.9;
+outlineMat.backFaceCulling = false;
+outline.material = outlineMat;
+outline.isVisible = false;
+outline.edgesWidth = 10.0;
+outline.enableEdgesRendering();
+outline.edgesColor = new BABYLON.Color4(1,1,1,1);
+
+// helper: get targeted block under crosshair (returns block world coords and face normal)
+function getTargetedBlock(maxDistance = 8) {
+    // pick from center of screen
+    const pick = scene.pick(scene.getEngine().getRenderWidth()/2, scene.getEngine().getRenderHeight()/2, (mesh) => mesh.name && mesh.name.indexOf("chunk_") === 0);
+    if (!pick || !pick.hit || !pick.pickedPoint) return null;
+    // compute normal
+    let normal = null;
+    if (pick.getNormal) normal = pick.getNormal(true);
+    // fallback normal guess based on ray direction and pickedPoint vs mesh center (not ideal but usable)
+    if (!normal) {
+        if (pick.ray && pick.pickedPoint) {
+            normal = pick.ray.direction.scale(-1);
+            normal.normalize();
+        } else {
+            normal = new BABYLON.Vector3(0,1,0);
+        }
+    }
+    // ensure distance check
+    const camPos = camera.position;
+    const dist = BABYLON.Vector3.Distance(camPos, pick.pickedPoint);
+    if (dist > maxDistance) return null;
+
+    // compute the block coordinates hit (the solid block)
+    // the block that was hit is roughly at floor(pickedPoint - normal * 0.5)
+    const hitPoint = pick.pickedPoint;
+    const hitBlockX = Math.floor(hitPoint.x - normal.x * 0.5 + 1e-6);
+    const hitBlockY = Math.floor(hitPoint.y - normal.y * 0.5 + 1e-6);
+    const hitBlockZ = Math.floor(hitPoint.z - normal.z * 0.5 + 1e-6);
+
+    // adjacent block where placement would occur
+    const placeBlockX = Math.floor(hitPoint.x + normal.x * 0.5 + 1e-6);
+    const placeBlockY = Math.floor(hitPoint.y + normal.y * 0.5 + 1e-6);
+    const placeBlockZ = Math.floor(hitPoint.z + normal.z * 0.5 + 1e-6);
+
+    return {
+        hit: { x: hitBlockX, y: hitBlockY, z: hitBlockZ },
+        place: { x: placeBlockX, y: placeBlockY, z: placeBlockZ },
+        normal,
+        distance: dist
+    };
+}
+
+// easier mining: on mousedown start mining; allow repeated breaks when holding
+let miningInterval = null;
+const MINE_REPEAT_MS = 150; // faster repeat to make mining easy
+
+function tryMineOnce() {
+    const t = getTargetedBlock(8);
+    if (!t) return;
+    const h = t.hit;
+    const block = getBlockAtWorld(h.x, h.y, h.z);
+    if (block === BLOCKS.AIR) return;
+    // allow ground removal (as requested). remove immediately
+    setBlockAtWorld(h.x, h.y, h.z, BLOCKS.AIR);
+}
+
+canvas.addEventListener("pointerdown", (ev) => {
+    // left = mine, right = place
+    if (ev.button === 0) {
+        tryMineOnce();
+        // start repeat while button held
+        if (miningInterval) clearInterval(miningInterval);
+        miningInterval = setInterval(tryMineOnce, MINE_REPEAT_MS);
+    } else if (ev.button === 2) {
+        // place block at adjacent location
+        const t = getTargetedBlock(8);
+        if (!t) return;
+        const p = t.place;
+        // simple safety: don't place inside player's body/head
+        const camPos = camera.position;
+        const dx = Math.abs(camPos.x - (p.x + 0.5));
+        const dy = Math.abs(camPos.y - (p.y + 0.5));
+        const dz = Math.abs(camPos.z - (p.z + 0.5));
+        if (dx < 0.6 && dy < 1.2 && dz < 0.6) return;
+        if (p.y < 0 || p.y >= CHUNK_HEIGHT) return;
+        setBlockAtWorld(p.x, p.y, p.z, selected);
+    }
+});
+canvas.addEventListener("pointerup", (ev) => {
+    if (ev.button === 0 && miningInterval) {
+        clearInterval(miningInterval);
+        miningInterval = null;
+    }
+});
+
+// prevent context menu on right click
+window.addEventListener("contextmenu", e => e.preventDefault());
+
+// Jumping & grounded detection
+const jumpBtn = document.getElementById("jumpBtn");
+let lastJumpTime = 0;
+const JUMP_COOLDOWN = 250; // ms
+// Adjusted jump strength slightly lower to match reduced gravity feel
+const JUMP_STRENGTH = 2.2;
+
+function isGrounded() {
+    // cast a short ray downwards from camera to detect ground within 1.05 units below camera bottom
+    const origin = camera.position.clone();
+    const down = new BABYLON.Vector3(0, -1, 0);
+    const ray = new BABYLON.Ray(origin, down, 1.2 + camera.ellipsoid.y); // check a bit below the ellipsoid
+    const pick = scene.pickWithRay(ray, (mesh) => mesh.name && mesh.name.indexOf("chunk_") === 0);
+    return pick && pick.hit;
+}
+
+function doJump() {
+    const now = performance.now();
+    if (now - lastJumpTime < JUMP_COOLDOWN) return;
+    if (!isGrounded()) return;
+    // raise camera position a little to simulate jump impulse; rely on gravity to pull back down
+    camera.position.y += JUMP_STRENGTH;
+    lastJumpTime = now;
+}
+jumpBtn.addEventListener("click", () => doJump());
+document.addEventListener("keydown", (e) => {
+    if (e.code === "Space") {
+        e.preventDefault();
+        doJump();
+    }
+});
+
+// Respawn if falling
+const RESPAWN_Y = -20;
+function respawnIfNeeded() {
+    if (camera.position.y < RESPAWN_Y) {
+        camera.position.copyFrom(spawnPosition);
+        // small upward nudge to avoid sticking
+        camera.position.y += 0.5;
+    }
+}
+
+// Visible-chunks update
+function worldToChunkCoord(wx) { return Math.floor(wx / CHUNK_SIZE); }
+let lastCenter = { cx: visibleCenterChunk.cx, cz: visibleCenterChunk.cz };
+function updateVisibleChunks() {
+    const cx = worldToChunkCoord(Math.floor(camera.position.x));
+    const cz = worldToChunkCoord(Math.floor(camera.position.z));
+    if (cx !== lastCenter.cx || cz !== lastCenter.cz) {
+        lastCenter = { cx, cz };
+        loadChunksAround(cx, cz, RENDER_DISTANCE_CHUNKS);
+    }
+}
+
+// info UI
+const infoEl = document.getElementById("info");
+function updateInfo() {
+    const cx = worldToChunkCoord(Math.floor(camera.position.x));
+    const cz = worldToChunkCoord(Math.floor(camera.position.z));
+    infoEl.innerText = `Chunk: ${cx},${cz}   Pos: ${camera.position.x.toFixed(2)},${camera.position.y.toFixed(2)},${camera.position.z.toFixed(2)}   RenderDist(chunks): ${RENDER_DISTANCE_CHUNKS}\nGrounded: ${isGrounded() ? "yes" : "no"}`;
+}
+
+// Outline update each frame (show white outline around targeted block)
+function updateOutline() {
+    const t = getTargetedBlock(8);
+    if (!t) {
+        outline.isVisible = false;
+        return;
+    }
+    const h = t.hit;
+    // ensure block exists
+    const block = getBlockAtWorld(h.x, h.y, h.z);
+    if (block === BLOCKS.AIR) {
+        outline.isVisible = false;
+        return;
+    }
+    outline.isVisible = true;
+    outline.position.x = h.x + 0.5;
+    outline.position.y = h.y + 0.5;
+    outline.position.z = h.z + 0.5;
+}
+
+// render loop
+engine.runRenderLoop(() => {
+    scene.render();
+    updateVisibleChunks();
+    updateInfo();
+    updateOutline();
+    respawnIfNeeded();
+});
+
+// handle resize
+window.addEventListener("resize", ()=>engine.resize());
+
+// Small utility: allow changing render distance via console or future UI
+window.setRenderDistanceChunks = function(n) {
+    const parsed = parseInt(n, 10);
+    if (!isNaN(parsed) && parsed >= 0 && parsed <= 8) {
+        RENDER_DISTANCE_CHUNKS = parsed;
+        // force immediate update
+        lastCenter = { cx: 99999, cz: 99999 };
+    }
+};
+
+// Safety: initial rebuild of visible chunks done already by loadChunksAround at start
+</script>
+
+<script>
+// --- Audio Setup ---
+function playAudioFromBase64(base64, volume=1.0) {
+    const audio = new Audio("data:audio/mp3;base64," + base64);
+    audio.volume = volume;
+    audio.play();
+}
+
+// --- Replace these with your actual Base64-encoded audio files ---
+const breakSoundBase64 = "BASE64_BREAK_SOUND_HERE";
+const placeSoundBase64 = "BASE64_PLACE_SOUND_HERE";
+const bgMusicBase64    = "BASE64_BG_MUSIC_HERE";
+
+// Functions to play sounds
+function playBlockBreak() { playAudioFromBase64(breakSoundBase64, 0.7); }
+function playBlockPlace() { playAudioFromBase64(placeSoundBase64, 0.7); }
+
+// Background music
+const bgMusic = new Audio("data:audio/mp3;base64," + bgMusicBase64);
+bgMusic.loop = true;
+bgMusic.volume = 0.3;
+bgMusic.play().catch(()=>{}); // will start after user interaction if autoplay is blocked
+
+// Hook into your block events
+canvas.addEventListener("pointerdown", (ev)=>{
+    if (ev.button === 0) { // mine
+        tryMineOnce();
+        playBlockBreak();
+        if (miningInterval) clearInterval(miningInterval);
+        miningInterval = setInterval(()=>{
+            tryMineOnce();
+            playBlockBreak();
+        }, 150);
+    } else if (ev.button === 2) { // place
+        const t = getTargetedBlock(8); if (!t) return;
+        const p = t.place;
+        const camPos = camera.position;
+        const dx = Math.abs(camPos.x - (p.x+0.5)), dy = Math.abs(camPos.y - (p.y+0.5)), dz = Math.abs(camPos.z - (p.z+0.5));
+        if (dx<0.6 && dy<1.2 && dz<0.6) return;
+        if (p.y<0 || p.y>=CHUNK_HEIGHT) return;
+        setBlockAtWorld(p.x,p.y,p.z, selected);
+        playBlockPlace();
+    }
+});
+</script>
+
+</body>
+</html>
