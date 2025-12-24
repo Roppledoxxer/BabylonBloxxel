@@ -479,10 +479,8 @@ function tryMineOnce() {
 canvas.addEventListener("pointerdown", (ev) => {
     // left = mine, right = place
     if (ev.button === 0) {
+        // Mine only once per click (no repeat while holding)
         tryMineOnce();
-        // start repeat while button held
-        if (miningInterval) clearInterval(miningInterval);
-        miningInterval = setInterval(tryMineOnce, MINE_REPEAT_MS);
     } else if (ev.button === 2) {
         // place block at adjacent location
         const t = getTargetedBlock(8);
@@ -638,24 +636,91 @@ function playBlockPlace() { playAudioFile(placeSoundFile, 0.7); }
 
 // Hook into existing block events
 canvas.addEventListener("pointerdown", (ev)=>{
-    if (ev.button === 0) { // left click - mine
-        tryMineOnce();
+    if (ev.button === 0) { // left click - play break sound (no game logic here)
         playBlockBreak();
-        if (miningInterval) clearInterval(miningInterval);
-        miningInterval = setInterval(()=>{
-            tryMineOnce();
-            playBlockBreak();
-        }, 150);
-    } else if (ev.button === 2) { // right click - place
-        const t = getTargetedBlock(8); if (!t) return;
-        const p = t.place;
-        const camPos = camera.position;
-        const dx = Math.abs(camPos.x - (p.x+0.5)), dy = Math.abs(camPos.y - (p.y+0.5)), dz = Math.abs(camPos.z - (p.z+0.5));
-        if (dx<0.6 && dy<1.2 && dz<0.6) return;
-        if (p.y<0 || p.y>=CHUNK_HEIGHT) return;
-        setBlockAtWorld(p.x,p.y,p.z, selected);
+    } else if (ev.button === 2) { // right click - play place sound (no game logic here)
         playBlockPlace();
     }
+});
+</script>
+<script>
+// --- Polished Day & Night Cycle ---
+let timeOfDay = 0;         // 0..1, 0 = midnight, 0.5 = noon
+const DAY_SPEED = 0.000005;  // lower = slower full day; adjust as needed
+
+// Colors for different times
+const nightColor = new BABYLON.Color4(0.02, 0.02, 0.05, 1);      // dark blue sky
+const dayColor = new BABYLON.Color4(0.53, 0.81, 0.98, 1);        // bright blue sky
+const sunriseColor = new BABYLON.Color4(1.0, 0.45, 0.2, 1);      // orange/red sunrise
+const sunsetColor = new BABYLON.Color4(1.0, 0.4, 0.15, 1);       // orange/red sunset
+
+function lerpColor(c1, c2, t) {
+    return new BABYLON.Color4(
+        c1.r + (c2.r - c1.r) * t,
+        c1.g + (c2.g - c1.g) * t,
+        c1.b + (c2.b - c1.b) * t,
+        1
+    );
+}
+
+function updateDayNightCycle() {
+    timeOfDay += DAY_SPEED;
+    if (timeOfDay > 1) timeOfDay -= 1; // loop day
+
+    // Sun height (-1 = midnight, 0 = sunrise/sunset, 1 = noon)
+    const sunHeight = Math.sin(timeOfDay * Math.PI * 2);
+
+    // Update directional light direction
+    dlight.direction = new BABYLON.Vector3(-0.5, -sunHeight, -0.5).normalize();
+
+    // Light intensity: night = 0.1, day = 0.7, smoothly interpolated
+    dlight.intensity = 0.1 + Math.max(0, sunHeight) * 0.6;
+
+    // Light color gradient for smooth sunrise/sunset
+    if (sunHeight > 0.1) {
+        // Daytime
+        dlight.diffuse = new BABYLON.Color3(1.0, 0.95, 0.9);
+    } else if (sunHeight > -0.1) {
+        // Sunrise / Sunset transition
+        if (sunHeight > 0) {
+            // Sunrise
+            const t = sunHeight / 0.1;
+            const c = lerpColor(sunriseColor, dayColor, t);
+            dlight.diffuse = new BABYLON.Color3(c.r, c.g, c.b);
+        } else {
+            // Sunset
+            const t = (sunHeight + 0.1) / 0.1;
+            const c = lerpColor(sunsetColor, nightColor, 1 - t);
+            dlight.diffuse = new BABYLON.Color3(c.r, c.g, c.b);
+        }
+    } else {
+        // Night
+        dlight.diffuse = new BABYLON.Color3(0.1, 0.1, 0.3);
+    }
+
+    // Sky color interpolation
+    let skyColor;
+    if (sunHeight > 0.1) {
+        skyColor = lerpColor(dayColor, sunriseColor, 0);
+    } else if (sunHeight > -0.1) {
+        if (sunHeight > 0) {
+            const t = sunHeight / 0.1;
+            skyColor = lerpColor(sunriseColor, dayColor, t);
+        } else {
+            const t = (sunHeight + 0.1) / 0.1;
+            skyColor = lerpColor(sunsetColor, nightColor, 1 - t);
+        }
+    } else {
+        skyColor = nightColor;
+    }
+
+    scene.clearColor = skyColor;
+}
+
+// --- Integrate into your existing render loop ---
+engine.runRenderLoop(() => {
+    scene.render();
+    updateDayNightCycle();
 });
 </script>
 
