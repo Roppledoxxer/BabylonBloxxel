@@ -614,33 +614,31 @@ window.setRenderDistanceChunks = function(n) {
 
 // Safety: initial rebuild of visible chunks done already by loadChunksAround at start
 </script>
-
 <script>
 // --- Audio Setup ---
-function playAudioFromBase64(base64, volume=1.0) {
-    const audio = new Audio("data:audio/mp3;base64," + base64);
+function playAudioFile(filename, volume = 1.0) {
+    const audio = new Audio(filename);
     audio.volume = volume;
-    audio.play();
+    audio.play().catch(()=>{}); // catch in case autoplay is blocked
 }
 
-// --- Replace these with your actual Base64-encoded audio files ---
-const breakSoundBase64 = "BASE64_BREAK_SOUND_HERE";
-const placeSoundBase64 = "BASE64_PLACE_SOUND_HERE";
-const bgMusicBase64    = "BASE64_BG_MUSIC_HERE";
-
-// Functions to play sounds
-function playBlockBreak() { playAudioFromBase64(breakSoundBase64, 0.7); }
-function playBlockPlace() { playAudioFromBase64(placeSoundBase64, 0.7); }
+// Sound effect filenames
+const breakSoundFile = "Punch.mp3";
+const placeSoundFile = "smallpunch.mp3";
 
 // Background music
-const bgMusic = new Audio("data:audio/mp3;base64," + bgMusicBase64);
+const bgMusic = new Audio("soundblocker.wav");
 bgMusic.loop = true;
 bgMusic.volume = 0.3;
-bgMusic.play().catch(()=>{}); // will start after user interaction if autoplay is blocked
+bgMusic.play().catch(()=>{}); // may start after first user interaction
 
-// Hook into your block events
+// Functions to play sounds
+function playBlockBreak() { playAudioFile(breakSoundFile, 0.7); }
+function playBlockPlace() { playAudioFile(placeSoundFile, 0.7); }
+
+// Hook into existing block events
 canvas.addEventListener("pointerdown", (ev)=>{
-    if (ev.button === 0) { // mine
+    if (ev.button === 0) { // left click - mine
         tryMineOnce();
         playBlockBreak();
         if (miningInterval) clearInterval(miningInterval);
@@ -648,7 +646,7 @@ canvas.addEventListener("pointerdown", (ev)=>{
             tryMineOnce();
             playBlockBreak();
         }, 150);
-    } else if (ev.button === 2) { // place
+    } else if (ev.button === 2) { // right click - place
         const t = getTargetedBlock(8); if (!t) return;
         const p = t.place;
         const camPos = camera.position;
