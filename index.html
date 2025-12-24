@@ -615,101 +615,46 @@ window.setRenderDistanceChunks = function(n) {
 // Safety: initial rebuild of visible chunks done already by loadChunksAround at start
 </script>
 <script>
-// --- Audio Setup & Preload ---
-const breakSound = new Audio("Punch.mp3");
-breakSound.volume = 0.7;
+// --- Audio Setup ---
+function playAudioFile(filename, volume = 1.0) {
+    const audio = new Audio(filename);
+    audio.volume = volume;
+    audio.play().catch(()=>{}); // catch in case autoplay is blocked
+}
 
-const placeSound = new Audio("smallpunch.mp3");
-placeSound.volume = 0.7;
+// Sound effect filenames
+const breakSoundFile = "Punch.mp3";
+const placeSoundFile = "smallpunch.mp3";
 
+// Background music
 const bgMusic = new Audio("soundblocker.mp3");
 bgMusic.loop = true;
 bgMusic.volume = 0.3;
+bgMusic.play().catch(()=>{}); // may start after first user interaction
 
-let audioStarted = false;
+// Functions to play sounds
+function playBlockBreak() { playAudioFile(breakSoundFile, 0.7); }
+function playBlockPlace() { playAudioFile(placeSoundFile, 0.7); }
 
-// Function to start background music (called once after first W press)
-function startAudio() {
-    if (audioStarted) return;
-    bgMusic.play().catch(() => {});
-    audioStarted = true;
-}
-
-// Functions to play block sounds
-function playBlockBreak() {
-    startAudio();
-    breakSound.currentTime = 0;
-    breakSound.play().catch(() => {});
-}
-
-function playBlockPlace() {
-    startAudio();
-    placeSound.currentTime = 0;
-    placeSound.play().catch(() => {});
-}
-
-// --- Mining & Placing Setup ---
-let miningInterval = null;
-const MINE_REPEAT_MS = 150; // interval for repeated mining
-
-function tryMineOnce() {
-    const t = getTargetedBlock(8);
-    if (!t) return;
-    const h = t.hit;
-    const block = getBlockAtWorld(h.x, h.y, h.z);
-    if (block === BLOCKS.AIR) return;
-
-    setBlockAtWorld(h.x, h.y, h.z, BLOCKS.AIR);
-    playBlockBreak();
-}
-
-// Handle pointer events for mining and placing
-canvas.addEventListener("pointerdown", (ev) => {
-    if (ev.button === 0) { // left click = mine
+// Hook into existing block events
+canvas.addEventListener("pointerdown", (ev)=>{
+    if (ev.button === 0) { // left click - mine
         tryMineOnce();
+        playBlockBreak();
         if (miningInterval) clearInterval(miningInterval);
-        miningInterval = setInterval(tryMineOnce, MINE_REPEAT_MS);
-    } else if (ev.button === 2) { // right click = place
-        const t = getTargetedBlock(8);
-        if (!t) return;
+        miningInterval = setInterval(()=>{
+            tryMineOnce();
+            playBlockBreak();
+        }, 150);
+    } else if (ev.button === 2) { // right click - place
+        const t = getTargetedBlock(8); if (!t) return;
         const p = t.place;
-
-        // prevent placing inside player
         const camPos = camera.position;
-        const dx = Math.abs(camPos.x - (p.x + 0.5));
-        const dy = Math.abs(camPos.y - (p.y + 0.5));
-        const dz = Math.abs(camPos.z - (p.z + 0.5));
-        if (dx < 0.6 && dy < 1.2 && dz < 0.6) return;
-        if (p.y < 0 || p.y >= CHUNK_HEIGHT) return;
-
-        setBlockAtWorld(p.x, p.y, p.z, selected);
+        const dx = Math.abs(camPos.x - (p.x+0.5)), dy = Math.abs(camPos.y - (p.y+0.5)), dz = Math.abs(camPos.z - (p.z+0.5));
+        if (dx<0.6 && dy<1.2 && dz<0.6) return;
+        if (p.y<0 || p.y>=CHUNK_HEIGHT) return;
+        setBlockAtWorld(p.x,p.y,p.z, selected);
         playBlockPlace();
-    }
-});
-
-canvas.addEventListener("pointerup", (ev) => {
-    if (ev.button === 0 && miningInterval) {
-        clearInterval(miningInterval);
-        miningInterval = null;
-    }
-});
-
-// prevent context menu on right click
-window.addEventListener("contextmenu", e => e.preventDefault());
-
-// --- Start audio on first W key press ---
-document.addEventListener("keydown", (e) => {
-    if (e.key.toLowerCase() === "w") {
-        startAudio();
-    }
-
-    // Inventory hotkeys 1-4
-    if (e.key >= "1" && e.key <= "4") {
-        const i = parseInt(e.key, 10) - 1;
-        document.querySelectorAll(".slot").forEach(s => s.classList.remove("active"));
-        const slot = document.querySelectorAll(".slot")[i];
-        if (slot) slot.classList.add("active");
-        selected = [BLOCKS.GRASS, BLOCKS.WOOD, BLOCKS.LEAVES, BLOCKS.PLANKS][i];
     }
 });
 </script>
